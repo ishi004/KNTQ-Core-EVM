@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>KNTQ Arbitrage Monitor</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+    <div id="app"></div>
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script>
+        const { useState, useEffect, useRef } = React;
+        const { createRoot } = ReactDOM;
+
+        function PriceMonitor() {
+            // ==================== State ====================
+            const [data, setData] = useState(null);
+            const [history, setHistory] = useState([]);
+            const [isMonitoring, setIsMonitoring] = useState(false);
+            const [alertThreshold, setAlertThreshold] = useState(1.0);
+            const [soundEnabled, setSoundEnabled] = useState(true);
+            const [connectionStatus, setConnectionStatus] = useState('disconnected');
+            const [evmConnectionStatus, setEvmConnectionStatus] = useState('disconnected');
+            const [lastUpdate, setLastUpdate] = useState(null);
+            const [hlOrderBook, setHlOrderBook] = useState({ bids: [], asks: [] });
+            const [evmPrice, setEvmPrice] = useState({ mid: 0, buyPrice: 0, sellPrice: 0, source: '' });
+            const [arbitrageOpportunity, setArbitrageOpportunity] = useState(null);
+            
+            // ==================== Refs ====================
+            const wsRef = useRef(null);
+            const evmWsRef = useRef(null);
+            const audioContextRef = useRef(null);
+            const priceCache = useRef({ hlMid: 0, hlBestBid: 0, hlBestAsk: 0, evm: 0 });
+            const evmPriceRef = useRef({ mid: 0, buyPrice: 0, sellPrice: 0, source: '' });
+            const reconnectTimeoutRef = useRef(null);
+            const evmReconnectTimeoutRef = useRef(null);
+            const alertIntervalRef = useRef(null);
+            const currentGapRef = useRef(0);
+
+            // ==================== Constants ====================
+            const HL_WS_URL = "wss://api.hyperliquid.xyz/ws";
+            const HL_TAKER_FEE = 0.000538; // Hyperliquid Core 테이커 수수료 (0.0538%)
+            const KNTQ = "0x000000000000780555bd0bca3791f89f9542c2d6";
+            const USDH = "0x111111a1a0667d36bd57c0a9f569b98057111111";
+
+            // ==================== Audio Alert ====================
+            const playAlertSound = (isHighPriority = false) => {
+                if (!soundEnabled) return;
+                
+                try {
+                    if (!audioContextRef.current) {
+                        audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)();
+                    }
+                    
+                    const audioContext = audioContextRef.current;
+                    const oscillator = audioContext.createOscillator();
+                    const gainNode = audioContext.createGain();
+                    
+                    oscillator.connect(gainNode);
+                    gainNode.connect(audioContext.destination);
+                    
+                    if (isHighPriority) {
+                        // 2배 이상: 높은 음 + 긴급 패턴
+                        oscillator.frequency.value = 1200;
+                        oscillator.type = 'square';
+                        gainNode.gain.setValueAtTime(0.4, audioContext.currentTime);
+                        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.3);
+                        oscillator.start(audioContext.currentTime);
+                        oscillator.stop(audioContext.currentTime + 0.3);
+                    } else {
+                        // 일반: 기본 음
+                        oscillator.frequency.value = 800;
+                        oscillator.type = 'sine';
+                        gainNode.gain.setValueAtTime(0.3, audioContext.currentTime);
+                        gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + 0.5);
+                        oscillator.start(audioContext.currentTime);
+                        oscillator.stop(audioContext.currentTime + 0.5);
+                    }
+                } catch (e) {
+                    console.error('Audio error:', e);
+                }
+            };
+
+            // ==================== Arbitrage Calculation ====================
+            const calculateArbitrage = (hlBids, hlAsks, evmMid, evmBuy, evmSell) => {
+                if (!hlBids.length || !hlAsks.length || evmMid === 0) return null;
+                
+                return {
+                    buyHL_sellEVM: analyzeDirection(hlAsks, evmSell, 'buy_hl'),
+                    buyEVM_sellHL: analyzeDirection(hlBids, evmBuy, 'buy_evm'),
+                    maxProfitableHL: findMaxProfitableVolume(hlAsks, evmSell, 'buy_hl'),
+                    maxProfitableEVM: findMaxProfitableVolume(hlBids, evmBuy, 'buy_evm')
+                };
+            };
+            
+            const analyzeDirection = (hlOrders, evmPrice, direction) => {
+                const results = [];
+                const targetAmounts = [100, 500, 1000, 2000, 5000];
+                
+                for (const targetUSD of targetAmounts) {
+                    let remainingUSD = targetUSD;
+                    let totalKNTQ = 0;
+                    
+                    for (const order of hlOrders) {
+                        if (remainingUSD <= 0) break;
+                        
+                        const priceNum = parseFloat(order.px);
+                        const sizeNum = parseFloat(order.sz);
+                        const orderValueUSD = priceNum * sizeNum;
+                        
+                        if (orderValueUSD <= remainingUSD) {
+                            totalKNTQ += sizeNum;
+                            remainingUSD -= orderValueUSD;
+                        } else {
+                            totalKNTQ += remainingUSD / priceNum;
+                            remainingUSD = 0;
+                        }
+                    }
+                    
+                    const feasible = remainingUSD < 0.1;
+                    const avgHLPrice = totalKNTQ > 0 ? (targetUSD - remainingUSD) / totalKNTQ : 0;
+                    
+                    let profit, profitPercent;
+                    if (direction === 'buy_hl') {
+                        const hlCost = (targetUSD - remainingUSD) * (1 + HL_TAKER_FEE); // HL 테이커 수수료 추가
+                        const evmRevenue = totalKNTQ * evmPrice;
+                        profit = evmRevenue - hlCost;
+                        profitPercent = hlCost > 0 ? (profit / hlCost * 100) : 0;
+                    } else {
+                        const evmCost = totalKNTQ * evmPrice;
+                        const hlRevenue = (targetUSD - remainingUSD) * (1 - HL_TAKER_FEE); // HL 테이커 수수료 차감
+                        profit = hlRevenue - evmCost;
+                        profitPercent = evmCost > 0 ? (profit / evmCost * 100) : 0;
+                    }
+                    
+                    results.push({
+                        targetUSD,
+                        feasible,
+                        kntqAmount: totalKNTQ,
+                        avgHLPrice,
+                        evmPrice,
+                        profit,
+                        profitPercent
+                    });
+                }
+                
+                return results;
+            };
+            
+            const findMaxProfitableVolume = (hlOrders, evmPrice, direction) => {
+                let cumulativeUSD = 0;
+                let cumulativeKNTQ = 0;
+                let maxProfitableUSD = 0;
+                let maxProfit = 0;
+                let bestAvgPrice = 0;
+                
+                for (const order of hlOrders) {
+                    const priceNum = parseFloat(order.px);
+                    const sizeNum = parseFloat(order.sz);
+                    
+                    cumulativeKNTQ += sizeNum;
+                    cumulativeUSD += priceNum * sizeNum;
+                    
+                    const avgHLPrice = cumulativeUSD / cumulativeKNTQ;
+                    
+                    let profit;
+                    if (direction === 'buy_hl') {
+                        const hlCost = cumulativeUSD * (1 + HL_TAKER_FEE); // HL 테이커 수수료 추가
+                        profit = cumulativeKNTQ * evmPrice - hlCost;
+                    } else {
+                        const hlRevenue = cumulativeUSD * (1 - HL_TAKER_FEE); // HL 테이커 수수료 차감
+                        profit = hlRevenue - cumulativeKNTQ * evmPrice;
+                    }
+                    
+                    if (profit > maxProfit) {
+                        maxProfit = profit;
+                        maxProfitableUSD = cumulativeUSD;
+                        bestAvgPrice = avgHLPrice;
+                    }
+                    
+                    if (profit < 0 && cumulativeUSD > 100) break;
+                    if (cumulativeUSD > 10000) break;
+                }
+                
+                return {
+                    maxVolumeUSD: maxProfitableUSD,
+                    maxProfit: maxProfit,
+                    maxProfitPercent: maxProfitableUSD > 0 ? (maxProfit / maxProfitableUSD * 100) : 0,
+                    avgPrice: bestAvgPrice,
+                    evmPrice: evmPrice
+                };
+            };
+
+            // ==================== Price Update ====================
+            const updatePrices = (orderBook = null, currentEvmPrice = null) => {
+                const hlMid = priceCache.current.hlMid;
+                const hlBestBid = priceCache.current.hlBestBid;
+                const hlBestAsk = priceCache.current.hlBestAsk;
+                const evmPrice = evmPriceRef.current;
+                
+                if (hlMid === 0 || !evmPrice || evmPrice.mid === 0) return;
+
+                // 양방향 차익 계산
+                // 방향 1: HL 매수 → EVM 매도
+                const hlBuyCost = hlBestAsk * (1 + HL_TAKER_FEE); // HL Ask + 수수료
+                const evmSellRevenue = evmPrice.sellPrice; // EVM Sell
+                const profitBuyHL = evmSellRevenue - hlBuyCost;
+                const profitPercentBuyHL = (profitBuyHL / hlBuyCost) * 100;
+                
+                // 방향 2: EVM 매수 → HL 매도
+                const evmBuyCost = evmPrice.buyPrice; // EVM Buy
+                const hlSellRevenue = hlBestBid * (1 - HL_TAKER_FEE); // HL Bid - 수수료
+                const profitBuyEVM = hlSellRevenue - evmBuyCost;
+                const profitPercentBuyEVM = (profitBuyEVM / evmBuyCost) * 100;
+                
+                // 알림용: 더 이익인 방향 선택 (양수 우선)
+                const gapPercent = profitPercentBuyHL > profitPercentBuyEVM 
+                    ? profitPercentBuyHL 
+                    : profitPercentBuyEVM;
+                
+                currentGapRef.current = gapPercent;
+
+                setData({
+                    timestamp: new Date(),
+                    hlMid,
+                    hlBestBid,
+                    hlBestAsk,
+                    evmMid: evmPrice.mid,
+                    evmBuy: evmPrice.buyPrice,
+                    evmSell: evmPrice.sellPrice,
+                    gap: evmPrice.mid - hlMid,
+                    gapPercent: gapPercent,
+                    // 양방향 차익 정보
+                    profitBuyHL: profitBuyHL,
+                    profitPercentBuyHL: profitPercentBuyHL,
+                    profitBuyEVM: profitBuyEVM,
+                    profitPercentBuyEVM: profitPercentBuyEVM
+                });
+                
+                setHistory(prev => [...prev.slice(-19), {
+                    timestamp: new Date(),
+                    hlMid,
+                    evmMid: evmPrice.mid,
+                    gapPercent: gapPercent
+                }]);
+                
+                setLastUpdate(new Date());
+
+                // Arbitrage calculation
+                if (orderBook?.bids?.length > 0 && orderBook?.asks?.length > 0 && evmPrice) {
+                    const arb = calculateArbitrage(
+                        orderBook.bids,
+                        orderBook.asks,
+                        evmPrice.mid,
+                        evmPrice.buyPrice,
+                        evmPrice.sellPrice
+                    );
+                    setArbitrageOpportunity(arb);
+                }
+
+                checkAndUpdateAlert();
+            };
+            
+            const checkAndUpdateAlert = () => {
+                const gapPercent = currentGapRef.current;
+                const absGap = Math.abs(gapPercent);
+                const isProfitable = gapPercent > 0; // 이익인지 확인
+                const isAboveThreshold = absGap >= alertThreshold && isProfitable; // 이익이면서 임계값 이상
+                const isHighPriority = absGap >= alertThreshold * 2 && isProfitable;
+                const isAlertActive = alertIntervalRef.current !== null;
+                
+                if (isAboveThreshold && !isAlertActive) {
+                    playAlertSound(isHighPriority);
+                    
+                    alertIntervalRef.current = setInterval(() => {
+                        const currentGap = currentGapRef.current;
+                        const currentAbs = Math.abs(currentGap);
+                        const currentProfitable = currentGap > 0;
+                        if (currentAbs >= alertThreshold && currentProfitable) {
+                            const isHigh = currentAbs >= alertThreshold * 2;
+                            playAlertSound(isHigh);
+                        }
+                    }, 1000);
+                    
+                } else if (!isAboveThreshold && isAlertActive) {
+                    clearInterval(alertIntervalRef.current);
+                    alertIntervalRef.current = null;
+                }
+            };
+
+            // ==================== HL WebSocket ====================
+            const connectWebSocket = () => {
+                if (wsRef.current?.readyState === WebSocket.OPEN) return;
+
+                const ws = new WebSocket(HL_WS_URL);
+                wsRef.current = ws;
+
+                ws.onopen = () => {
+                    setConnectionStatus('connected');
+                    ws.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'allMids' } }));
+                    ws.send(JSON.stringify({ method: 'subscribe', subscription: { type: 'l2Book', coin: '@254' } }));
+                };
+
+                ws.onmessage = (event) => {
+                    try {
+                        const message = JSON.parse(event.data);
+                        
+                        if (message.channel === 'l2Book' && message.data?.coin === '@254') {
+                            const { levels } = message.data;
+                            const bids = levels[0] || [];
+                            const asks = levels[1] || [];
+                            
+                            const newOrderBook = { bids, asks };
+                            setHlOrderBook(newOrderBook);
+                            
+                            if (bids.length > 0 && asks.length > 0) {
+                                const bestBid = parseFloat(bids[0].px);
+                                const bestAsk = parseFloat(asks[0].px);
+                                const midPrice = (bestBid + bestAsk) / 2;
+                                
+                                priceCache.current.hlMid = midPrice;
+                                priceCache.current.hlBestBid = bestBid;
+                                priceCache.current.hlBestAsk = bestAsk;
+                                
+                                updatePrices(newOrderBook, evmPriceRef.current);
+                            }
+                        }
+                        
+                        if (message.channel === 'allMids' && message.data?.mids?.['@254']) {
+                            const price = parseFloat(message.data.mids['@254']);
+                            if (price > 0 && priceCache.current.hlMid === 0) {
+                                priceCache.current.hlMid = price;
+                                priceCache.current.hlBestBid = price * 0.9995;
+                                priceCache.current.hlBestAsk = price * 1.0005;
+                                updatePrices();
+                            }
+                        }
+                    } catch (e) {
+                        console.error('HL error:', e);
+                    }
+                };
+
+                ws.onerror = () => setConnectionStatus('error');
+                ws.onclose = () => {
+                    setConnectionStatus('disconnected');
+                    if (isMonitoring) {
+                        reconnectTimeoutRef.current = setTimeout(connectWebSocket, 3000);
+                    }
+                };
+            };
+
+            // ==================== EVM WebSocket ====================
+            const connectEVMWebSocket = () => {
+                // KyberSwap API 사용으로 변경
+                let kyberPollInterval = null;
+                
+                const fetchKyberSwapPrice = async () => {
+                    try {
+                        // Buy Price: USDC -> KNTQ (1500 USDC로 KNTQ 매수)
+                        const buyAmount = (1500 * 1e6).toString();
+                        const buyUrl = `https://aggregator-api.kyberswap.com/hyperevm/api/v1/routes?tokenIn=${USDH}&tokenOut=${KNTQ}&amountIn=${buyAmount}&gasInclude=true`;
+                        
+                        const buyResponse = await fetch(buyUrl);
+                        
+                        if (!buyResponse.ok) {
+                            console.error('Buy route error:', buyResponse.status);
+                            setEvmConnectionStatus('error');
+                            return;
+                        }
+                        
+                        const buyData = await buyResponse.json();
+                        
+                        if (!buyData.data?.routeSummary) {
+                            console.error('No buy route found');
+                            setEvmConnectionStatus('error');
+                            return;
+                        }
+                        
+                        // Buy 가격 계산
+                        const kntqReceived = parseFloat(buyData.data.routeSummary.amountOut) / 1e18;
+                        const buyPrice = 1500 / kntqReceived;
+                        
+                        // Sell Price: KNTQ -> USDC
+                        const sellAmountBigInt = BigInt(buyData.data.routeSummary.amountOut);
+                        const sellAmount = sellAmountBigInt.toString();
+                        const sellUrl = `https://aggregator-api.kyberswap.com/hyperevm/api/v1/routes?tokenIn=${KNTQ}&tokenOut=${USDH}&amountIn=${sellAmount}&gasInclude=true`;
+                        
+                        const sellResponse = await fetch(sellUrl);
+                        
+                        let sellPrice = buyPrice;
+                        
+                        if (sellResponse.ok) {
+                            const sellData = await sellResponse.json();
+                            
+                            if (sellData.data?.routeSummary) {
+                                const usdcReceived = parseFloat(sellData.data.routeSummary.amountOut) / 1e6;
+                                sellPrice = usdcReceived / kntqReceived;
+                            }
+                        } else {
+                            console.warn('Sell route not available, using buy price');
+                        }
+                        
+                        const mid = (buyPrice + sellPrice) / 2;
+                        
+                        priceCache.current.evm = mid;
+                        
+                        const newEvmPrice = {
+                            mid: mid,
+                            buyPrice: buyPrice,
+                            sellPrice: sellPrice,
+                            source: 'KyberSwap'
+                        };
+                        
+                        evmPriceRef.current = newEvmPrice;
+                        setEvmPrice(newEvmPrice);
+                        setEvmConnectionStatus('connected');
+                        updatePrices();
+                        
+                    } catch (e) {
+                        console.error('KyberSwap API error:', e);
+                        setEvmConnectionStatus('error');
+                    }
+                };
+                
+                // 초기 호출
+                fetchKyberSwapPrice();
+                setEvmConnectionStatus('connected');
+                
+                // 1초마다 폴링
+                kyberPollInterval = setInterval(fetchKyberSwapPrice, 1000);
+                
+                // Cleanup
+                const cleanup = () => {
+                    if (kyberPollInterval) {
+                        clearInterval(kyberPollInterval);
+                    }
+                };
+                
+                evmWsRef.current = { close: cleanup };
+            };
+
+            // ==================== Effects ====================
+            useEffect(() => {
+                if (isMonitoring) {
+                    connectWebSocket();
+                    connectEVMWebSocket();
+                } else {
+                    if (wsRef.current) wsRef.current.close();
+                    if (evmWsRef.current) evmWsRef.current.close();
+                    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+                    if (evmReconnectTimeoutRef.current) clearTimeout(evmReconnectTimeoutRef.current);
+                    if (alertIntervalRef.current) clearInterval(alertIntervalRef.current);
+                    setConnectionStatus('disconnected');
+                    setEvmConnectionStatus('disconnected');
+                }
+
+                return () => {
+                    if (wsRef.current) wsRef.current.close();
+                    if (evmWsRef.current) evmWsRef.current.close();
+                    if (reconnectTimeoutRef.current) clearTimeout(reconnectTimeoutRef.current);
+                    if (evmReconnectTimeoutRef.current) clearTimeout(evmReconnectTimeoutRef.current);
+                    if (alertIntervalRef.current) clearInterval(alertIntervalRef.current);
+                };
+            }, [isMonitoring]);
+            
+            useEffect(() => {
+                if (isMonitoring && data) checkAndUpdateAlert();
+            }, [alertThreshold]);
+
+            // ==================== UI Helpers ====================
+            const getStatusColor = (status) => {
+                switch(status) {
+                    case 'connected': return 'text-green-400';
+                    case 'error': return 'text-red-400';
+                    default: return 'text-slate-500';
+                }
+            };
+
+            const avgGap = history.length > 0 ? history.reduce((sum, item) => sum + item.gapPercent, 0) / history.length : 0;
+            const maxGap = history.length > 0 ? Math.max(...history.map(item => Math.abs(item.gapPercent))) : 0;
+
+            // ==================== Render ====================
+            return React.createElement('div', { 
+                className: 'min-h-screen bg-gradient-to-br from-slate-900 via-purple-900 to-slate-900 text-white p-6'
+            },
+                React.createElement('div', { className: 'max-w-7xl mx-auto space-y-6' },
+                    // Header
+                    React.createElement('div', { className: 'flex items-center justify-between' },
+                        React.createElement('h1', { className: 'text-3xl font-bold' }, '💎 KNTQ 차익거래 모니터'),
+                        React.createElement('button', { 
+                            onClick: () => setSoundEnabled(!soundEnabled),
+                            className: 'p-3 rounded-lg bg-slate-700 hover:bg-slate-600 transition'
+                        }, soundEnabled ? '🔊' : '🔇')
+                    ),
+
+                    // Connection Status
+                    React.createElement('div', { className: 'bg-slate-800 rounded-lg p-4 border border-slate-700' },
+                        React.createElement('div', { className: 'flex items-center justify-between text-sm' },
+                            React.createElement('div', { className: 'flex gap-6' },
+                                React.createElement('div', { className: 'flex gap-2' },
+                                    React.createElement('span', { className: 'text-slate-400' }, 'HL:'),
+                                    React.createElement('span', { className: getStatusColor(connectionStatus) }, 
+                                        connectionStatus === 'connected' ? '● 연결' : '○ 끊김'
+                                    )
+                                ),
+                                React.createElement('div', { className: 'flex gap-2' },
+                                    React.createElement('span', { className: 'text-slate-400' }, 'EVM (KyberSwap):'),
+                                    React.createElement('span', { className: getStatusColor(evmConnectionStatus) }, 
+                                        evmConnectionStatus === 'connected' ? `● 연결` : '○ 끊김'
+                                    )
+                                )
+                            ),
+                            lastUpdate && React.createElement('span', { className: 'text-slate-400' }, 
+                                lastUpdate.toLocaleTimeString()
+                            )
+                        ),
+                        React.createElement('div', { className: 'mt-2 pt-2 border-t border-slate-700 text-xs text-slate-400' },
+                            '💡 수익률은 HL Core 테이커 수수료(0.0538%) 반영됨'
+                        )
+                    ),
+
+                    // Controls
+                    React.createElement('div', { className: 'bg-slate-800 rounded-lg p-6 border border-slate-700' },
+                        React.createElement('div', { className: 'flex gap-4 items-center' },
+                            React.createElement('button', {
+                                onClick: () => setIsMonitoring(!isMonitoring),
+                                className: `px-6 py-3 rounded-lg font-bold transition ${
+                                    isMonitoring ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'
+                                }`
+                            }, isMonitoring ? '⏸ 중지' : '▶ 시작'),
+                            
+                            React.createElement('div', { className: 'flex gap-2 items-center' },
+                                React.createElement('label', { className: 'text-slate-400' }, '알람:'),
+                                React.createElement('input', {
+                                    type: 'number',
+                                    value: alertThreshold,
+                                    onChange: (e) => setAlertThreshold(parseFloat(e.target.value)),
+                                    step: 0.1,
+                                    min: 0.1,
+                                    className: 'bg-slate-700 px-3 py-2 rounded w-20 text-center'
+                                }),
+                                React.createElement('span', { className: 'text-slate-400' }, '% (2배 시 다른 소리)')
+                            )
+                        )
+                    ),
+
+                    // Prices
+                    data && React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-6' },
+                        React.createElement('div', { className: 'bg-gradient-to-br from-blue-600 to-blue-700 rounded-lg p-6 border border-blue-500' },
+                            React.createElement('div', { className: 'text-blue-200 text-sm mb-2' }, 'Hyperliquid Core'),
+                            React.createElement('div', { className: 'text-3xl font-bold mb-3' }, '$' + data.hlMid.toFixed(6)),
+                            React.createElement('div', { className: 'space-y-1 text-sm' },
+                                React.createElement('div', { className: 'flex justify-between' },
+                                    React.createElement('span', { className: 'text-blue-200' }, 'Bid:'),
+                                    React.createElement('span', { className: 'font-mono text-green-300' }, '$' + data.hlBestBid.toFixed(6))
+                                ),
+                                React.createElement('div', { className: 'flex justify-between' },
+                                    React.createElement('span', { className: 'text-blue-200' }, 'Ask:'),
+                                    React.createElement('span', { className: 'font-mono text-red-300' }, '$' + data.hlBestAsk.toFixed(6))
+                                )
+                            )
+                        ),
+
+                        React.createElement('div', { className: 'bg-gradient-to-br from-purple-600 to-purple-700 rounded-lg p-6 border border-purple-500' },
+                            React.createElement('div', { className: 'text-purple-200 text-sm mb-2' }, 
+                                'HyperEVM Pool (' + evmPrice.source + ')'
+                            ),
+                            React.createElement('div', { className: 'text-3xl font-bold mb-3' }, '$' + evmPrice.mid.toFixed(6)),
+                            React.createElement('div', { className: 'space-y-1 text-sm' },
+                                React.createElement('div', { className: 'flex justify-between' },
+                                    React.createElement('span', { className: 'text-purple-200' }, 'Buy:'),
+                                    React.createElement('span', { className: 'font-mono text-red-300' }, '$' + evmPrice.buyPrice.toFixed(6))
+                                ),
+                                React.createElement('div', { className: 'flex justify-between' },
+                                    React.createElement('span', { className: 'text-purple-200' }, 'Sell:'),
+                                    React.createElement('span', { className: 'font-mono text-green-300' }, '$' + evmPrice.sellPrice.toFixed(6))
+                                )
+                            )
+                        )
+                    ),
+
+                    // Gap - 양방향 표시
+                    data && React.createElement('div', { className: 'bg-slate-800 rounded-lg p-6 border border-slate-700' },
+                        React.createElement('h3', { className: 'text-xl font-bold mb-4 text-center' }, '💰 차익거래 기회'),
+                        
+                        React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-4' },
+                            // 방향 1: HL 매수 → EVM 매도
+                            React.createElement('div', { 
+                                className: `rounded-lg p-6 border-2 ${
+                                    data.profitPercentBuyHL > 0 
+                                        ? 'bg-green-900/30 border-green-500' 
+                                        : 'bg-red-900/30 border-red-500'
+                                }`
+                            },
+                                React.createElement('div', { className: 'text-sm text-slate-300 mb-2' }, '🔴 HL 매수 → EVM 매도'),
+                                React.createElement('div', { 
+                                    className: `text-4xl font-bold mb-2 ${
+                                        data.profitPercentBuyHL > 0 ? 'text-green-400' : 'text-red-400'
+                                    }`
+                                }, 
+                                    (data.profitPercentBuyHL >= 0 ? '+' : '') + data.profitPercentBuyHL.toFixed(3) + '%'
+                                ),
+                                React.createElement('div', { className: 'text-sm text-slate-400 space-y-1' },
+                                    React.createElement('div', null, 
+                                        '매수: $' + data.hlBestAsk.toFixed(6) + ' (HL Ask)'
+                                    ),
+                                    React.createElement('div', null, 
+                                        '수수료: +0.0538%'
+                                    ),
+                                    React.createElement('div', null, 
+                                        '매도: $' + data.evmSell.toFixed(6) + ' (EVM Sell)'
+                                    ),
+                                    React.createElement('div', { 
+                                        className: `font-bold ${
+                                            data.profitPercentBuyHL > 0 ? 'text-green-400' : 'text-red-400'
+                                        }`
+                                    }, 
+                                        '순손익: ' + (data.profitPercentBuyHL >= 0 ? '+' : '') + 
+                                        '$' + data.profitBuyHL.toFixed(6)
+                                    )
+                                )
+                            ),
+                            
+                            // 방향 2: EVM 매수 → HL 매도
+                            React.createElement('div', { 
+                                className: `rounded-lg p-6 border-2 ${
+                                    data.profitPercentBuyEVM > 0 
+                                        ? 'bg-green-900/30 border-green-500' 
+                                        : 'bg-red-900/30 border-red-500'
+                                }`
+                            },
+                                React.createElement('div', { className: 'text-sm text-slate-300 mb-2' }, '🔵 EVM 매수 → HL 매도'),
+                                React.createElement('div', { 
+                                    className: `text-4xl font-bold mb-2 ${
+                                        data.profitPercentBuyEVM > 0 ? 'text-green-400' : 'text-red-400'
+                                    }`
+                                }, 
+                                    (data.profitPercentBuyEVM >= 0 ? '+' : '') + data.profitPercentBuyEVM.toFixed(3) + '%'
+                                ),
+                                React.createElement('div', { className: 'text-sm text-slate-400 space-y-1' },
+                                    React.createElement('div', null, 
+                                        '매수: $' + data.evmBuy.toFixed(6) + ' (EVM Buy)'
+                                    ),
+                                    React.createElement('div', null, 
+                                        '매도: $' + data.hlBestBid.toFixed(6) + ' (HL Bid)'
+                                    ),
+                                    React.createElement('div', null, 
+                                        '수수료: -0.0538%'
+                                    ),
+                                    React.createElement('div', { 
+                                        className: `font-bold ${
+                                            data.profitPercentBuyEVM > 0 ? 'text-green-400' : 'text-red-400'
+                                        }`
+                                    }, 
+                                        '순손익: ' + (data.profitPercentBuyEVM >= 0 ? '+' : '') + 
+                                        '$' + data.profitBuyEVM.toFixed(6)
+                                    )
+                                )
+                            )
+                        )
+                    ),
+
+                    // Arbitrage
+                    arbitrageOpportunity && React.createElement('div', { className: 'space-y-6' },
+                        React.createElement('div', { className: 'bg-gradient-to-r from-green-900/40 to-emerald-900/40 rounded-lg p-6 border-2 border-green-600' },
+                            React.createElement('h3', { className: 'text-xl font-bold mb-4 text-green-300' }, 
+                                '💰 최대 수익 물량'
+                            ),
+                            React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-6' },
+                                React.createElement('div', { className: 'bg-slate-800/50 rounded-lg p-4' },
+                                    React.createElement('div', { className: 'text-red-300 font-semibold mb-3' }, '🔴 HL→EVM'),
+                                    arbitrageOpportunity.maxProfitableHL.maxProfit > 0 ? 
+                                        React.createElement('div', { className: 'space-y-2' },
+                                            React.createElement('div', { className: 'text-3xl font-bold text-green-400' },
+                                                '$' + arbitrageOpportunity.maxProfitableHL.maxVolumeUSD.toFixed(0)
+                                            ),
+                                            React.createElement('div', { className: 'text-sm text-slate-300' },
+                                                '수익: ',
+                                                React.createElement('span', { className: 'text-green-400 font-bold' },
+                                                    '+$' + arbitrageOpportunity.maxProfitableHL.maxProfit.toFixed(2) +
+                                                    ' (' + arbitrageOpportunity.maxProfitableHL.maxProfitPercent.toFixed(2) + '%)'
+                                                )
+                                            )
+                                        ) :
+                                        React.createElement('div', { className: 'text-slate-400' }, '❌ 수익 없음')
+                                ),
+                                
+                                React.createElement('div', { className: 'bg-slate-800/50 rounded-lg p-4' },
+                                    React.createElement('div', { className: 'text-blue-300 font-semibold mb-3' }, '🔵 EVM→HL'),
+                                    arbitrageOpportunity.maxProfitableEVM.maxProfit > 0 ? 
+                                        React.createElement('div', { className: 'space-y-2' },
+                                            React.createElement('div', { className: 'text-3xl font-bold text-green-400' },
+                                                '$' + arbitrageOpportunity.maxProfitableEVM.maxVolumeUSD.toFixed(0)
+                                            ),
+                                            React.createElement('div', { className: 'text-sm text-slate-300' },
+                                                '수익: ',
+                                                React.createElement('span', { className: 'text-green-400 font-bold' },
+                                                    '+$' + arbitrageOpportunity.maxProfitableEVM.maxProfit.toFixed(2) +
+                                                    ' (' + arbitrageOpportunity.maxProfitableEVM.maxProfitPercent.toFixed(2) + '%)'
+                                                )
+                                            )
+                                        ) :
+                                        React.createElement('div', { className: 'text-slate-400' }, '❌ 수익 없음')
+                                )
+                            )
+                        ),
+                        
+                        React.createElement('div', { className: 'grid grid-cols-1 md:grid-cols-2 gap-6' },
+                            React.createElement('div', { className: 'bg-slate-800 rounded-lg p-6 border border-slate-700' },
+                                React.createElement('h3', { className: 'text-lg font-bold mb-4 text-red-400' }, '🔴 HL→EVM (물량별)'),
+                                React.createElement('div', { className: 'space-y-3' },
+                                    arbitrageOpportunity.buyHL_sellEVM.map((opp, idx) => 
+                                        React.createElement('div', { 
+                                            key: idx,
+                                            className: `p-3 rounded ${opp.profit > 0 ? 'bg-green-900/30 border border-green-700' : 'bg-slate-700/50'}`
+                                        },
+                                            React.createElement('div', { className: 'flex justify-between items-center mb-2' },
+                                                React.createElement('span', { className: 'font-bold' }, '$' + opp.targetUSD),
+                                                opp.feasible ? 
+                                                    React.createElement('span', { className: opp.profit > 0 ? 'text-green-400 font-bold' : 'text-slate-400' },
+                                                        (opp.profit > 0 ? '+' : '') + '$' + opp.profit.toFixed(2)
+                                                    ) :
+                                                    React.createElement('span', { className: 'text-red-400 text-xs' }, '유동성 부족')
+                                            ),
+                                            React.createElement('div', { className: 'text-xs text-slate-400' },
+                                                `${opp.kntqAmount.toFixed(0)} KNTQ | HL: $${opp.avgHLPrice.toFixed(6)} | EVM: $${opp.evmPrice.toFixed(6)}`
+                                            )
+                                        )
+                                    )
+                                )
+                            ),
+
+                            React.createElement('div', { className: 'bg-slate-800 rounded-lg p-6 border border-slate-700' },
+                                React.createElement('h3', { className: 'text-lg font-bold mb-4 text-blue-400' }, '🔵 EVM→HL (물량별)'),
+                                React.createElement('div', { className: 'space-y-3' },
+                                    arbitrageOpportunity.buyEVM_sellHL.map((opp, idx) => 
+                                        React.createElement('div', { 
+                                            key: idx,
+                                            className: `p-3 rounded ${opp.profit > 0 ? 'bg-green-900/30 border border-green-700' : 'bg-slate-700/50'}`
+                                        },
+                                            React.createElement('div', { className: 'flex justify-between items-center mb-2' },
+                                                React.createElement('span', { className: 'font-bold' }, '$' + opp.targetUSD),
+                                                opp.feasible ? 
+                                                    React.createElement('span', { className: opp.profit > 0 ? 'text-green-400 font-bold' : 'text-slate-400' },
+                                                        (opp.profit > 0 ? '+' : '') + '$' + opp.profit.toFixed(2)
+                                                    ) :
+                                                    React.createElement('span', { className: 'text-red-400 text-xs' }, '유동성 부족')
+                                            ),
+                                            React.createElement('div', { className: 'text-xs text-slate-400' },
+                                                `${opp.kntqAmount.toFixed(0)} KNTQ | EVM: $${opp.evmPrice.toFixed(6)} | HL: $${opp.avgHLPrice.toFixed(6)}`
+                                            )
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+            );
+        }
+
+        const root = createRoot(document.getElementById('app'));
+        root.render(React.createElement(PriceMonitor));
+    </script>
+</body>
+</html>
