@@ -1,4 +1,3 @@
-KNTQ Arbitrage Monitor
 KNTQ Arbitrage Monitor는 Hyperliquid Core와 HyperEVM 간의 KNTQ 토큰 가격 차이를 실시간으로 추적하여 차익거래 기회를 포착하는 웹 기반 도구입니다.
 
 주요 기능
